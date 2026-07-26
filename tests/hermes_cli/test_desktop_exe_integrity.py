@@ -107,7 +107,7 @@ def test_parse_pe_machine_rejects_bad_pe_signature(tmp_path):
     ],
 )
 def test_expected_machines_per_host(host, loadable, not_loadable):
-    with patch("platform.machine", return_value=host):
+    with patch("hermes_cli.main._windows_native_machine", return_value=host):
         expected = cli_main._expected_windows_pe_machines()
     assert loadable <= expected
     assert not (not_loadable & expected)
@@ -115,9 +115,195 @@ def test_expected_machines_per_host(host, loadable, not_loadable):
 
 def test_expected_machines_unknown_host_is_permissive():
     """The gate must never brick launch on hosts we don't recognize."""
-    with patch("platform.machine", return_value="RISCV64"):
+    with patch("hermes_cli.main._windows_native_machine", return_value="RISCV64"):
         expected = cli_main._expected_windows_pe_machines()
     assert {PE_AMD64, PE_ARM64, PE_I386} <= expected
+
+
+# ─── _windows_native_machine ────────────────────────────────────────────────
+
+# winnt.h PROCESSOR_ARCHITECTURE_* — mirrors hermes_cli.main constants.
+_SYSINFO_AMD64 = 9
+_SYSINFO_ARM64 = 12
+
+
+class _SettableFunc:
+    """Callable that accepts ctypes ``.restype`` / ``.argtypes`` assignment."""
+
+    def __init__(self, fn):
+        self._fn = fn
+        self.restype = None
+        self.argtypes = None
+
+    def __call__(self, *args, **kwargs):
+        return self._fn(*args, **kwargs)
+
+
+class _FakeKernel32:
+    """Stands in for kernel32 so the native-arch probes run on any CI OS."""
+
+    def __init__(
+        self,
+        native_pe_machine: int,
+        *,
+        wow64_ok: bool = True,
+        system_info_arch: int | None = None,
+    ):
+        self._native_pe = native_pe_machine
+        self._wow64_ok = wow64_ok
+        self._system_info_arch = system_info_arch
+        self.GetCurrentProcess = _SettableFunc(lambda: -1)
+        self.IsWow64Process2 = _SettableFunc(self._is_wow64_process2)
+        self.GetNativeSystemInfo = _SettableFunc(self._get_native_system_info)
+
+    def _is_wow64_process2(self, _handle, process_ref, native_ref):
+        if not self._wow64_ok:
+            return 0
+        process_ref._obj.value = PE_AMD64  # emulated x64 process
+        native_ref._obj.value = self._native_pe
+        return 1
+
+    def _get_native_system_info(self, info_ref):
+        if self._system_info_arch is None:
+            raise AttributeError("GetNativeSystemInfo unavailable in this fake")
+        info_ref._obj.wProcessorArchitecture = self._system_info_arch
+
+
+def _fake_windll(
+    native_pe_machine: int,
+    *,
+    wow64_ok: bool = True,
+    system_info_arch: int | None = None,
+):
+    kernel32 = _FakeKernel32(
+        native_pe_machine,
+        wow64_ok=wow64_ok,
+        system_info_arch=system_info_arch,
+    )
+
+    def _windll(name, *args, **kwargs):
+        assert "kernel32" in str(name).lower()
+        return kernel32
+
+    return _windll
+
+
+def test_native_machine_reports_os_arch_not_process_arch(monkeypatch):
+    """The #69179 WoA regression: x64 Python under ARM64 emulation must report
+    ARM64 (the OS), not AMD64 (the process) — otherwise the integrity gate
+    rejects the correct ARM64 rebuild."""
+    import ctypes
+
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    # WinDLL only exists on Windows; create=True so Linux/macOS CI can stub it.
+    with patch.object(ctypes, "WinDLL", _fake_windll(PE_ARM64), create=True), \
+         patch("platform.machine", return_value="AMD64"):
+        assert cli_main._windows_native_machine() == "ARM64"
+
+
+def test_native_machine_binds_current_process_handle_restype(monkeypatch):
+    """ctypes must type GetCurrentProcess as HANDLE — default c_int truncates
+    the pseudo-handle on Win64 and makes IsWow64Process2 return
+    ERROR_INVALID_HANDLE, re-breaking the #71218 gate on WoA."""
+    import ctypes
+    from ctypes import wintypes
+
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    windll = _fake_windll(PE_ARM64)
+    with patch.object(ctypes, "WinDLL", windll, create=True), \
+         patch("platform.machine", return_value="AMD64"):
+        assert cli_main._windows_native_machine() == "ARM64"
+    kernel32 = windll("kernel32")
+    assert kernel32.GetCurrentProcess.restype is wintypes.HANDLE
+    assert kernel32.IsWow64Process2.argtypes is not None
+
+
+def test_native_machine_system_info_fallback_when_iswow64_fails(monkeypatch):
+    """Residual #71218 failure: IsWow64Process2 returns FALSE (e.g. invalid
+    handle) while PROCESSOR_ARCHITECTURE still lies as AMD64. GetNativeSystemInfo
+    must still report the real ARM64 host so the integrity gate accepts the
+    correctly-built ARM64 Hermes.exe."""
+    import ctypes
+
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    monkeypatch.setenv("PROCESSOR_ARCHITECTURE", "AMD64")
+    monkeypatch.delenv("PROCESSOR_ARCHITEW6432", raising=False)
+    with patch.object(
+        ctypes,
+        "WinDLL",
+        _fake_windll(PE_ARM64, wow64_ok=False, system_info_arch=_SYSINFO_ARM64),
+        create=True,
+    ), patch("platform.machine", return_value="AMD64"):
+        assert cli_main._windows_native_machine() == "ARM64"
+
+
+def test_native_machine_env_fallback_without_api(monkeypatch):
+    """Pre-1511 Windows 10: no IsWow64Process2 / GetNativeSystemInfo → env."""
+    import ctypes
+
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    monkeypatch.setenv("PROCESSOR_ARCHITEW6432", "AMD64")
+
+    def _no_kernel32(name, *args, **kwargs):
+        raise OSError(f"no {name} in this fake pre-1511 host")
+
+    with patch.object(ctypes, "WinDLL", _no_kernel32, create=True), \
+         patch("platform.machine", return_value="x86"):
+        assert cli_main._windows_native_machine() == "AMD64"
+
+
+def test_native_machine_platform_fallback(monkeypatch):
+    """No API, no env vars → the historical platform.machine() answer."""
+    import ctypes
+
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    monkeypatch.delenv("PROCESSOR_ARCHITEW6432", raising=False)
+    monkeypatch.delenv("PROCESSOR_ARCHITECTURE", raising=False)
+
+    def _no_kernel32(name, *args, **kwargs):
+        raise OSError(f"no {name} in this fake host")
+
+    with patch.object(ctypes, "WinDLL", _no_kernel32, create=True), \
+         patch("platform.machine", return_value="AMD64"):
+        assert cli_main._windows_native_machine() == "AMD64"
+
+
+def test_native_machine_non_windows_uses_platform(monkeypatch):
+    monkeypatch.setattr(cli_main.sys, "platform", "linux")
+    with patch("platform.machine", return_value="aarch64"):
+        assert cli_main._windows_native_machine() == "AARCH64"
+
+
+def test_integrity_gate_accepts_arm64_exe_from_emulated_x64_process(monkeypatch, tmp_path):
+    """End-to-end shape of the reporter's failure: ARM64 host, x64 updater
+    process, correctly-built ARM64 Hermes.exe. The gate must pass it."""
+    import ctypes
+
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    exe = make_pe(tmp_path / "Hermes.exe", PE_ARM64)
+    with patch.object(ctypes, "WinDLL", _fake_windll(PE_ARM64), create=True), \
+         patch("platform.machine", return_value="AMD64"):
+        assert cli_main._desktop_exe_integrity_error(exe) is None
+
+
+def test_integrity_gate_accepts_arm64_when_iswow64_fails_but_system_info_ok(
+    monkeypatch, tmp_path
+):
+    """End-to-end residual WoA shape: IsWow64Process2 fails, env lies as AMD64,
+    GetNativeSystemInfo reports ARM64, ARM64 Hermes.exe must pass the gate."""
+    import ctypes
+
+    monkeypatch.setattr(cli_main.sys, "platform", "win32")
+    monkeypatch.setenv("PROCESSOR_ARCHITECTURE", "AMD64")
+    monkeypatch.delenv("PROCESSOR_ARCHITEW6432", raising=False)
+    exe = make_pe(tmp_path / "Hermes.exe", PE_ARM64)
+    with patch.object(
+        ctypes,
+        "WinDLL",
+        _fake_windll(PE_ARM64, wow64_ok=False, system_info_arch=_SYSINFO_ARM64),
+        create=True,
+    ), patch("platform.machine", return_value="AMD64"):
+        assert cli_main._desktop_exe_integrity_error(exe) is None
 
 
 # ─── _desktop_exe_integrity_error ───────────────────────────────────────────
@@ -125,7 +311,7 @@ def test_expected_machines_unknown_host_is_permissive():
 
 def test_integrity_error_none_for_matching_arch(tmp_path):
     exe = make_pe(tmp_path / "Hermes.exe", PE_AMD64)
-    with patch("platform.machine", return_value="AMD64"):
+    with patch("hermes_cli.main._windows_native_machine", return_value="AMD64"):
         assert cli_main._desktop_exe_integrity_error(exe) is None
 
 
@@ -133,7 +319,7 @@ def test_integrity_error_reports_arch_mismatch(tmp_path):
     """ARM64 exe on the reporter's 'Windows 10 AMD64' host — the wrong-arch
     flavor of 'This app can't run on your computer'."""
     exe = make_pe(tmp_path / "Hermes.exe", PE_ARM64)
-    with patch("platform.machine", return_value="AMD64"):
+    with patch("hermes_cli.main._windows_native_machine", return_value="AMD64"):
         error = cli_main._desktop_exe_integrity_error(exe)
     assert error is not None and "architecture mismatch" in error
     assert "ARM64" in error
@@ -159,7 +345,7 @@ def test_packaged_executable_prefers_host_arch_over_mtime(tmp_path, monkeypatch)
 
     os.utime(bad, (bad.stat().st_atime + 1000, bad.stat().st_mtime + 1000))
 
-    with patch("platform.machine", return_value="AMD64"):
+    with patch("hermes_cli.main._windows_native_machine", return_value="AMD64"):
         assert cli_main._desktop_packaged_executable(desktop_dir) == good
 
 
@@ -175,7 +361,7 @@ def test_packaged_executable_falls_back_to_mtime_when_unparseable(tmp_path, monk
     import os
 
     os.utime(b, (b.stat().st_atime + 1000, b.stat().st_mtime + 1000))
-    with patch("platform.machine", return_value="AMD64"):
+    with patch("hermes_cli.main._windows_native_machine", return_value="AMD64"):
         assert cli_main._desktop_packaged_executable(desktop_dir) == b
 
 
@@ -194,7 +380,7 @@ def test_rollback_restores_backup_and_keeps_corrupt_copy(tmp_path):
     backup_exe = desktop_dir / "release" / "win-unpacked.bak" / "Hermes.exe"
     make_pe(backup_exe, PE_AMD64)  # valid old build
 
-    with patch("platform.machine", return_value="AMD64"):
+    with patch("hermes_cli.main._windows_native_machine", return_value="AMD64"):
         restored = cli_main._rollback_desktop_from_backup(exe)
 
     assert restored == exe
@@ -232,7 +418,7 @@ def test_gate_passes_valid_exe(tmp_path, monkeypatch):
     monkeypatch.setattr(cli_main.sys, "platform", "win32")
     desktop_dir, exe = _win_tree(tmp_path)
     make_pe(exe, PE_AMD64)
-    with patch("platform.machine", return_value="AMD64"):
+    with patch("hermes_cli.main._windows_native_machine", return_value="AMD64"):
         verified, rolled_back = cli_main._ensure_desktop_exe_launchable(desktop_dir, exe)
     assert verified == exe
     assert rolled_back is False
@@ -259,7 +445,7 @@ def test_gate_rolls_back_corrupt_exe_and_purges_cache(tmp_path, monkeypatch, cap
     stamp.parent.mkdir(parents=True, exist_ok=True)
     stamp.write_text("{}", encoding="utf-8")
 
-    with patch("platform.machine", return_value="AMD64"), \
+    with patch("hermes_cli.main._windows_native_machine", return_value="AMD64"), \
          patch("hermes_cli.main._purge_electron_build_cache", return_value=[]) as mock_purge, \
          patch("hermes_cli.main._desktop_stamp_path", return_value=stamp):
         verified, rolled_back = cli_main._ensure_desktop_exe_launchable(desktop_dir, exe)
@@ -336,7 +522,7 @@ def test_build_only_fails_when_pack_produces_corrupt_exe(tmp_path, monkeypatch, 
          patch("hermes_cli.main._purge_electron_build_cache", return_value=[]), \
          patch("hermes_cli.main._desktop_stamp_path", return_value=tmp_path / "stamp.json"), \
          patch("hermes_cli.main._write_desktop_build_stamp") as mock_stamp, \
-         patch("platform.machine", return_value="AMD64"), \
+         patch("hermes_cli.main._windows_native_machine", return_value="AMD64"), \
          patch("hermes_cli.main.subprocess.run", return_value=pack_ok), \
          pytest.raises(SystemExit) as exc:
         cli_main.cmd_gui(_ns())
@@ -368,7 +554,7 @@ def test_build_only_succeeds_with_valid_exe(tmp_path, monkeypatch, capsys):
          patch("hermes_cli.main._desktop_build_needed", return_value=True), \
          patch("hermes_cli.main._stop_desktop_processes_locking_build", return_value=[]), \
          patch("hermes_cli.main._write_desktop_build_stamp") as mock_stamp, \
-         patch("platform.machine", return_value="AMD64"), \
+         patch("hermes_cli.main._windows_native_machine", return_value="AMD64"), \
          patch("hermes_cli.main.subprocess.run", return_value=pack_ok):
         cli_main.cmd_gui(_ns())
 
