@@ -3,7 +3,7 @@ import { type ReactNode, useEffect, useLayoutEffect, useMemo, useRef } from 'rea
 import { useNavigate } from 'react-router-dom'
 
 import { blurComposerInput } from '@/app/chat/composer/focus'
-import { clearSurfaceVar, setSurfaceVar, STATUS_STACK_VAR } from '@/app/chat/surface-vars'
+import { chatSurfaceRoot, clearSurfaceVar, setSurfaceVar, STATUS_STACK_VAR } from '@/app/chat/surface-vars'
 import { AGENTS_ROUTE } from '@/app/routes'
 import { BillingBanner } from '@/components/billing-banner'
 import { composerDockCard } from '@/components/chat/composer-dock'
@@ -12,6 +12,7 @@ import { Button } from '@/components/ui/button'
 import { Codicon } from '@/components/ui/codicon'
 import { Tip, TipKeybindLabel } from '@/components/ui/tooltip'
 import { type Translations, useI18n } from '@/i18n'
+import { useSessionSlice } from '@/lib/use-session-slice'
 import { cn } from '@/lib/utils'
 import { $billingBlock } from '@/store/billing-block'
 import {
@@ -84,17 +85,18 @@ interface ComposerStatusStackProps {
 export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackProps) {
   const { t } = useI18n()
   const navigate = useNavigate()
-  const itemsBySession = useStore($statusItemsBySession)
-  const previewsBySession = useStore($previewStatusBySession)
+  // Subscribe to THIS session's slice only. Both maps churn on other
+  // sessions' activity (subagent ticks, background polls, preview updates in
+  // any tile); a whole-map `useStore` re-rendered every mounted stack — one
+  // per open tile — on all of it. The per-key arrays are referentially stable
+  // across unrelated writes, so the slice hook bails out unless OUR session's
+  // items actually changed.
+  const items = useSessionSlice($statusItemsBySession, sessionId)
+  const previews = useSessionSlice($previewStatusBySession, sessionId)
   const scrolledUp = useStore($threadScrolledUp)
   const billing = useStore($billingBlock)
 
-  const groups = useMemo(
-    () => groupStatusItems(sessionId ? (itemsBySession[sessionId] ?? []) : []),
-    [itemsBySession, sessionId]
-  )
-
-  const previews = sessionId ? (previewsBySession[sessionId] ?? []) : []
+  const groups = useMemo(() => groupStatusItems(items), [items])
 
   // Seed from the registry on session open; event-driven refreshes (terminal /
   // process tool completions) live in use-message-stream.
@@ -218,11 +220,16 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
     const el = stackRef.current
 
     if (!visible || !el) {
-      clearSurfaceVar(el, STATUS_STACK_VAR)
-
       return
     }
 
+    // Resolve the owning surface NOW, while the node is attached. The cleanup
+    // below runs after the stack collapsed and React removed the div, so
+    // closest() from the detached node misses [data-chat-surface] and would
+    // clear the document root instead — leaving the stale height on the
+    // surface, which keeps inflating the thread's bottom clearance until the
+    // next publish.
+    const root = chatSurfaceRoot(el)
     let last = -1
 
     const sync = () => {
@@ -240,7 +247,7 @@ export function ComposerStatusStack({ queue, sessionId }: ComposerStatusStackPro
 
     return () => {
       observer.disconnect()
-      clearSurfaceVar(el, STATUS_STACK_VAR)
+      clearSurfaceVar(root, STATUS_STACK_VAR)
     }
   }, [visible])
 
