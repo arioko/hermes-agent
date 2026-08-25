@@ -1060,6 +1060,19 @@ def _rpc_poll_loop(
             stop_event.wait(poll_interval)
 
 
+def _format_interrupted_output(stdout_text: str) -> str:
+    """Append an interruption marker without guessing who caused it."""
+    from tools.interrupt import get_interrupt_reason
+
+    reason = get_interrupt_reason()
+    marker = (
+        f"[execution interrupted — {reason}]"
+        if reason
+        else "[execution interrupted]"
+    )
+    return f"{stdout_text}\n{marker}" if stdout_text else marker
+
+
 def _execute_remote(
     code: str,
     task_id: Optional[str],
@@ -1238,9 +1251,7 @@ def _execute_remote(
             duration, timeout, tool_call_counter[0],
         )
     elif status == "interrupted":
-        result["output"] = (
-            stdout_text + "\n[execution interrupted — user sent a new message]"
-        )
+        result["output"] = _format_interrupted_output(stdout_text)
     elif exit_code != 0:
         result["status"] = "error"
         result["error"] = f"Script exited with code {exit_code}"
@@ -1710,7 +1721,7 @@ def execute_code(
                 duration, timeout, tool_call_counter[0],
             )
         elif status == "interrupted":
-            result["output"] = stdout_text + "\n[execution interrupted — user sent a new message]"
+            result["output"] = _format_interrupted_output(stdout_text)
         elif exit_code != 0:
             result["status"] = "error"
             result["error"] = stderr_text or f"Script exited with code {exit_code}"
@@ -1762,53 +1773,40 @@ def execute_code(
 
 
 def _kill_process_group(proc, escalate: bool = False):
-    """Kill the child and its entire process tree (cross-platform via psutil)."""
-    import psutil
-    try:
-        parent = psutil.Process(proc.pid)
-        children = parent.children(recursive=True)
-        for child in children:
+    """Kill the child and its entire process tree (cross-platform).
+
+    Delegates to :func:`agent.deadline.kill_process_tree` (#85125 4d):
+    SIGTERM to the whole tree first (killpg when the child leads its own
+    group — it does, ``start_new_session=True`` — plus a psutil descendant
+    sweep for setsid'd grandchildren; ``taskkill /T /F`` on Windows).
+    With ``escalate=True`` the child gets 5s to exit after SIGTERM, then the
+    surviving tree is SIGKILLed — same escalation the old psutil-local body
+    implemented. Never raises; a delegation failure degrades to a plain
+    ``proc.kill()`` like the old psutil-failure fallback.
+    """
+    import signal as _signal
+
+    def _tree_signal(sig) -> None:
+        try:
+            from agent.deadline import kill_process_tree as _deadline_kill_tree
+
+            _deadline_kill_tree(proc.pid, sig=sig)
+        except Exception as e:
+            logger.debug("Could not terminate process tree: %s", e, exc_info=True)
             try:
-                child.terminate()
-            except psutil.NoSuchProcess:
-                pass
-        try:
-            parent.terminate()
-        except psutil.NoSuchProcess:
-            pass
-    except psutil.NoSuchProcess:
-        pass
-    except (PermissionError, OSError) as e:
-        logger.debug("Could not terminate process tree: %s", e, exc_info=True)
-        try:
-            proc.kill()
-        except Exception as e2:
-            logger.debug("Could not kill process: %s", e2, exc_info=True)
+                proc.kill()
+            except Exception as e2:
+                logger.debug("Could not kill process: %s", e2, exc_info=True)
+
+    # sig is ignored on Windows (taskkill /F is already forceful).
+    _tree_signal(getattr(_signal, "SIGTERM", None))
 
     if escalate:
         # Give the process 5s to exit after SIGTERM, then SIGKILL
         try:
             proc.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            try:
-                parent = psutil.Process(proc.pid)
-                for child in parent.children(recursive=True):
-                    try:
-                        child.kill()
-                    except psutil.NoSuchProcess:
-                        pass
-                try:
-                    parent.kill()
-                except psutil.NoSuchProcess:
-                    pass
-            except psutil.NoSuchProcess:
-                pass
-            except (PermissionError, OSError) as e:
-                logger.debug("Could not kill process tree: %s", e, exc_info=True)
-                try:
-                    proc.kill()
-                except Exception as e2:
-                    logger.debug("Could not kill process: %s", e2, exc_info=True)
+            _tree_signal(getattr(_signal, "SIGKILL", None))
 
 
 def _load_config() -> dict:
